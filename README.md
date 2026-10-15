@@ -11,6 +11,8 @@ The model is a mock. The point is the memory management and scheduling, which wo
 
 **Headline (simulated, see [Simulation](#simulation-results)):** on a multi-tenant workload where requests share system prompts, continuous batching with the prefix cache gives **1.8x–3.3x the output throughput of static batching**. At 8 req/s, it cuts p99 time-to-first-token from **55s to 0.21s**. These numbers come from a simulated clock with a made-up cost model. They are not GPU measurements.
 
+**Correctness is checked on a real model:** driving GPT-2 through the scheduler with real paged KV tensors gives exactly the same tokens as recomputing everything without a cache. That holds with prefix reuse, chunked prefill and preemption. See [Testing](#testing).
+
 ---
 
 ## The problem
@@ -223,6 +225,7 @@ Intel Mac, Release build.
 | `tests/test_invariants.py` | **Hypothesis state machine.** Random add / abort / step with aborts mid-batch. After every step, every block's `ref_count == (1 if cached) + (live requests holding it)`. At the end: no livelock, no leaks. | 300 runs × 60 steps |
 | `tests/test_server.py` | **Real uvicorn on a real socket.** Streaming, 429, 400/422, client disconnect frees blocks, 50 concurrent streams, slow client cut off, shutdown drain, engine crash → 503. | 11 |
 | `tests/test_tokenizer.py` | UTF-8 round trip, streaming multi-byte characters, shared prefixes. | 4 |
+| `tests/test_cache_correctness.py` | **Real model (GPT-2 small, CPU).** A `PyTorchKVStore` maps block ids to real KV tensors in a paged pool. The scheduler drives GPT-2: chunked prefill, prefix reuse across requests, and preemption under a tiny pool. Every output must match a no-cache baseline: **token ids exactly**, logits within 1e-5 relative. Also asserts nobody ever writes into a shared cached block. | 3 |
 
 Also:
 - `mypy --strict` is clean.
@@ -233,6 +236,8 @@ Also:
   - a scheduler infinite loop
   - no abort on client disconnect
   - unbounded buffering for slow clients
+  - KV blocks gathered in the wrong order (GPT-2 test)
+  - KV written one position off (GPT-2 test)
 
 ---
 
@@ -248,6 +253,18 @@ python3 -m venv .venv
 .venv/bin/mypy --strict prefixserve     # type check
 .venv/bin/python bench/sim.py           # simulation -> bench/results.json
 ```
+
+### GPT-2 correctness test (optional)
+
+Needs torch and transformers. On an Intel Mac, torch stops at 2.2.2 (Python ≤ 3.12), so it uses its own venv. In the main venv this test is skipped.
+
+```bash
+python3.12 -m venv .venv-torch
+.venv-torch/bin/pip install "torch==2.2.2" "numpy<2" "transformers>=4.40,<4.50" pytest -e .
+.venv-torch/bin/python -m pytest tests/test_cache_correctness.py
+```
+
+Why logits are compared *relative* to their size: GPT-2 logits reach ~300. Float32 rounding alone moves them ~1e-3 when the additions happen in a different order. HuggingFace's own KV cache differs from full recompute by 8.7e-4. A fixed 1e-5 limit would fail even for HuggingFace. A wrong KV block moves logits by whole units.
 
 ### Run the server
 

@@ -12,6 +12,7 @@ _skbuild/
 
 # Python
 .venv/
+.venv-torch/
 __pycache__/
 .pytest_cache/
 .hypothesis/

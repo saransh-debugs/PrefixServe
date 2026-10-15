@@ -144,6 +144,7 @@ class Scheduler:
         max_waiting: int = 1024,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         eos_token_id: int | None = None,
+        enable_prefix_cache: bool = True,
     ) -> None:
         if max_waiting < 1 or chunk_size < 1:
             raise ValueError("max_waiting and chunk_size must be >= 1")
@@ -152,6 +153,9 @@ class Scheduler:
         self._max_waiting = max_waiting
         self._chunk_size = chunk_size
         self._eos = eos_token_id
+        # Off = plain paged continuous batching. Only used to measure what the
+        # cache buys in the simulation.
+        self._use_cache = enable_prefix_cache
 
         self._requests: dict[str, Request] = {}
         self._waiting: deque[Request] = deque()
@@ -354,7 +358,7 @@ class Scheduler:
         seq = req.seq()
         # Leave at least 1 token uncached: the model needs to process
         # something to produce the next token's logits.
-        matched, cached = self.tree.match_prefix(seq[:-1])
+        matched, cached = self.tree.match_prefix(seq[:-1]) if self._use_cache else (0, [])
         remaining = len(seq) - matched
         n = 1 if remaining == 1 else min(self._chunk_size, remaining, budget)
         need = blocks_for(matched + n) - len(cached) if n > 0 else 0
@@ -430,5 +434,5 @@ class Scheduler:
 
     def _cache(self, req: Request) -> None:
         """Puts the request's computed full blocks into the tree."""
-        if req.num_computed >= BLOCK_SIZE:
+        if self._use_cache and req.num_computed >= BLOCK_SIZE:
             self.tree.insert(req.seq()[: req.num_computed], req.block_table)

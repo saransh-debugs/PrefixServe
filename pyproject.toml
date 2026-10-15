@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "hypothesis>=6"]
+test = ["pytest>=8", "hypothesis>=6", "mypy>=1.10"]
 
 [tool.scikit-build]
 cmake.build-type = "Release"

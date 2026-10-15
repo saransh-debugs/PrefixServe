@@ -1,0 +1,33 @@
+{
+  "note": "Real GPT-2 small on CPU. One request at a time (no batched forward pass): measures prefix-cache savings only, not batching.",
+  "torch": "2.2.2",
+  "transformers": "4.49.0",
+  "single_request": {
+    "prompt_tokens": 268,
+    "cold_ms": 356.6922650206834,
+    "warm_ms": 86.66813606396317
+  },
+  "cache_off": {
+    "total_s": 18.916982867987826,
+    "model_s": 18.91366017179098,
+    "scheduler_s": 0.0015055160038173199,
+    "prompt_tokens": 4012,
+    "prefill_tokens_computed": 4012,
+    "prefix_hit_rate": 0.0,
+    "ttft_mean_s": 6.613138967484701,
+    "ttft_p50_s": 9.71740682492964,
+    "output_tok_per_s": 13.532813439991784
+  },
+  "cache_on": {
+    "total_s": 15.71121902600862,
+    "model_s": 15.707873015082441,
+    "scheduler_s": 0.00140449870377779,
+    "prompt_tokens": 4012,
+    "prefill_tokens_computed": 908,
+    "prefix_hit_rate": 0.773678963110668,
+    "ttft_mean_s": 5.1171526642283425,
+    "ttft_p50_s": 8.42800558602903,
+    "output_tok_per_s": 16.294088929459466
+  },
+  "identical_outputs": true
+}

@@ -214,6 +214,32 @@ Intel Mac, Release build.
 
 ---
 
+## Real GPT-2 timing (CPU)
+
+`bench/gpt2_bench.py` runs real GPT-2 small through the scheduler on CPU, with KV in a real paged tensor pool. These are real wall-clock numbers, not simulated.
+
+**One request, 268 prompt tokens (median of 5):**
+
+| Cache state | Time to first token |
+|---|---|
+| Cold (nothing cached) | 357ms |
+| Warm (tenant's system prompt cached) | **87ms (4.1x faster)** |
+
+**16 requests, 2 tenants, ~266 prompt tokens each, 16 new tokens each:**
+
+| | Cache off | Cache on |
+|---|---|---|
+| Prompt tokens actually computed | 4,012 | **908 (4.4x fewer)** |
+| Prefix hit rate | 0% | 77% |
+| Mean time to first token | 6.61s | 5.12s |
+| Total time | 18.92s | 15.71s (1.2x) |
+| Time spent in the scheduler | 1.5ms | 1.4ms |
+| Same output text | ✅ | ✅ |
+
+**Why total time only improves 1.2x:** the cache only saves *prompt* work. Here most time is decode: 256 one-token steps, run one request at a time. Each step also copies the request's whole KV out of the paged pool into the shape HuggingFace expects. A real serving stack uses a paged-attention kernel that reads blocks in place and batches requests together. That's out of scope here.
+
+**Scheduler overhead is ~0.01% of runtime** (1.4ms of 15.7s).
+
 ## Testing
 
 | Suite | What it checks | Tests |
@@ -262,6 +288,7 @@ Needs torch and transformers. On an Intel Mac, torch stops at 2.2.2 (Python ≤ 
 python3.12 -m venv .venv-torch
 .venv-torch/bin/pip install "torch==2.2.2" "numpy<2" "transformers>=4.40,<4.50" pytest -e .
 .venv-torch/bin/python -m pytest tests/test_cache_correctness.py
+.venv-torch/bin/python bench/gpt2_bench.py      # real timing, cache on vs off
 ```
 
 Why logits are compared *relative* to their size: GPT-2 logits reach ~300. Float32 rounding alone moves them ~1e-3 when the additions happen in a different order. HuggingFace's own KV cache differs from full recompute by 8.7e-4. A fixed 1e-5 limit would fail even for HuggingFace. A wrong KV block moves logits by whole units.
@@ -330,6 +357,8 @@ bench/
   micro_core.cpp           match_prefix timing
   sim.py                   fake-clock scheduler simulation
   results.json             latest simulation output
+  gpt2_bench.py            real GPT-2 timing, cache on vs off (torch venv)
+  gpt2_results.json        latest GPT-2 timing output
 ```
 
 ## Known limits

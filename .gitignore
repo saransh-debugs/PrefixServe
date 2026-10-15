@@ -1,0 +1,27 @@
+# Local prep notes. Not part of the project.
+PROMPTS.md
+INTERVIEW_PREP.md
+PLAN.md
+
+# Build output
+build/
+dist/
+*.egg-info/
+*.so
+_skbuild/
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+
+# Rust
+target/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

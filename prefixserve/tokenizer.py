@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import codecs
 from collections.abc import Iterable, Sequence
-from typing import Literal, TypedDict
+from typing import Literal, Protocol, TypedDict
 
 PAD_ID = 0
 BOS_ID = 1
@@ -68,3 +68,42 @@ class StreamDecoder:
 
     def flush(self) -> str:
         return self._dec.decode(b"", final=True)
+
+
+# ------------------------------------------------- what the server needs
+
+
+class Detokenizer(Protocol):
+    def push(self, token: int) -> str:
+        """Text that became final with this token. Often "" mid-character."""
+        ...
+
+    def flush(self) -> str: ...
+
+
+class TextTokenizer(Protocol):
+    def encode_prompt(self, text: str) -> list[int]:
+        """Raw /v1/completions prompt -> ids, BOS included."""
+        ...
+
+    def encode_chat(self, messages: Sequence[ChatMessage]) -> list[int]: ...
+
+    def decode(self, tokens: Sequence[int]) -> str: ...
+
+    def stream_decoder(self) -> Detokenizer: ...
+
+
+class ByteTokenizer:
+    """The dependency-free tokenizer above, behind the TextTokenizer interface."""
+
+    def encode_prompt(self, text: str) -> list[int]:
+        return [BOS_ID, *encode(text)]
+
+    def encode_chat(self, messages: Sequence[ChatMessage]) -> list[int]:
+        return apply_chat_template(messages)
+
+    def decode(self, tokens: Sequence[int]) -> str:
+        return decode(tokens)
+
+    def stream_decoder(self) -> StreamDecoder:
+        return StreamDecoder()

@@ -11,6 +11,7 @@ would give no speedup and the simulation would show nothing.
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass
 
 from prefixserve.scheduler import Batch
@@ -45,6 +46,11 @@ class CostModel:
 
 
 class MockEngine:
+    # No real KV pool and no length limit: the server's config decides.
+    num_blocks: int | None = None
+    max_seq_len: int | None = None
+    stop_token_ids: frozenset[int] = frozenset({EOS_ID})
+
     def __init__(self, cost: CostModel | None = None, *, eos_prob: float = 0.0, seed: int = 0) -> None:
         if not 0.0 <= eos_prob <= 1.0:
             raise ValueError("eos_prob must be in [0, 1]")
@@ -54,6 +60,12 @@ class MockEngine:
 
     def step_seconds(self, batch: Batch) -> float:
         return self.cost.batch_seconds(batch)
+
+    def step(self, batch: Batch) -> dict[str, int]:
+        """Blocking, like a real GPU step. The server runs it in a worker
+        thread, so this sleep never stalls the event loop."""
+        time.sleep(self.step_seconds(batch))
+        return self.sample(batch)
 
     def sample(self, batch: Batch) -> dict[str, int]:
         """One token for every work item that reached the end of its sequence."""

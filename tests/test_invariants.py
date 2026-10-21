@@ -23,7 +23,7 @@ PREFIXES = [list(range(16)), list(range(16)) + list(range(100, 132)), list(range
 class SchedulerMachine(RuleBasedStateMachine):
     def __init__(self) -> None:
         super().__init__()
-        self.s = Scheduler(NUM_BLOCKS, max_waiting=8, chunk_size=24, eos_token_id=EOS)
+        self.s = Scheduler(NUM_BLOCKS, max_waiting=8, chunk_size=24, stop_token_ids={EOS})
         self.ids: set[str] = set()
         self.next_id = 0
 

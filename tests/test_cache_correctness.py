@@ -100,10 +100,22 @@ class PyTorchKVStore:
 
 
 def legacy_kv(past: Any) -> list[tuple[Any, Any]]:
-    """HF returns either a tuple or a Cache object depending on version."""
+    """Per-layer (k, v) out of whatever HF returned. transformers 5 keeps them
+    in cache.layers; 4.x had to_legacy_cache(); older still, plain tuples."""
+    if hasattr(past, "layers"):
+        return [(layer.keys, layer.values) for layer in past.layers]
     if hasattr(past, "to_legacy_cache"):
         past = past.to_legacy_cache()
     return [(k, v) for k, v in past]
+
+
+def to_hf_cache(kv: list[tuple[Any, Any]]) -> Any:
+    """Builds a DynamicCache via update(), which exists in transformers 4 and 5
+    (from_legacy_cache was removed in 5)."""
+    cache = transformers.DynamicCache()
+    for layer, (k, v) in enumerate(kv):
+        cache.update(k, v, layer)
+    return cache
 
 
 class PagedGPT2Engine:
@@ -133,9 +145,7 @@ class PagedGPT2Engine:
 
         past = None
         if w.start > 0:
-            past = transformers.DynamicCache.from_legacy_cache(
-                tuple(self.store.gather(req.block_table, w.start))
-            )
+            past = to_hf_cache(self.store.gather(req.block_table, w.start))
         ids = torch.tensor([seq[w.start : w.end].tolist()])
         pos = torch.arange(w.start, w.end)[None]
         out = self.model(input_ids=ids, past_key_values=past, position_ids=pos, use_cache=True)

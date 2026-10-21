@@ -71,6 +71,10 @@ class Request:
     prompt: TokenArray
     max_tokens: int
     arrival: int  # arrival order. Kept across preemption so priority is kept too.
+    # Keep going past stop tokens until max_tokens. Benchmarks need it: every
+    # engine must produce exactly the same number of tokens, or the
+    # throughput comparison is meaningless.
+    ignore_eos: bool = False
     state: ReqState = ReqState.WAITING
     output: list[int] = field(default_factory=list)
     block_table: list[int] = field(default_factory=list)  # we hold 1 ref on each
@@ -143,7 +147,7 @@ class Scheduler:
         *,
         max_waiting: int = 1024,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
-        eos_token_id: int | None = None,
+        stop_token_ids: Iterable[int] = (),
         enable_prefix_cache: bool = True,
     ) -> None:
         if max_waiting < 1 or chunk_size < 1:
@@ -152,7 +156,9 @@ class Scheduler:
         self.tree = RadixTree(self.block_manager)
         self._max_waiting = max_waiting
         self._chunk_size = chunk_size
-        self._eos = eos_token_id
+        # A set, not one id: Llama-3.1-Instruct ends turns with <|eot_id|>
+        # but can also emit <|end_of_text|> or <|eom_id|>.
+        self._stop = frozenset(stop_token_ids)
         # Off = plain paged continuous batching. Only used to measure what the
         # cache buys in the simulation.
         self._use_cache = enable_prefix_cache
@@ -172,13 +178,20 @@ class Scheduler:
     # ------------------------------------------------------------------ API
 
     def add_request(
-        self, req_id: str, prompt: Iterable[int] | TokenArray, max_tokens: int
+        self,
+        req_id: str,
+        prompt: Iterable[int] | TokenArray,
+        max_tokens: int,
+        *,
+        ignore_eos: bool = False,
     ) -> AddResult:
         result = self._validate(req_id, prompt, max_tokens)
         if isinstance(result, AddResult):
             self._rejected += 1
             return result
-        req = Request(req_id=req_id, prompt=result, max_tokens=max_tokens, arrival=self._next_arrival)
+        req = Request(
+            req_id=req_id, prompt=result, max_tokens=max_tokens, arrival=self._next_arrival, ignore_eos=ignore_eos
+        )
         self._next_arrival += 1
         self._requests[req_id] = req
         self._waiting.append(req)
@@ -270,7 +283,7 @@ class Scheduler:
             new_tokens[req.req_id] = token
             if req.abort_pending:
                 continue  # handled below
-            if self._eos is not None and token == self._eos:
+            if token in self._stop and not req.ignore_eos:
                 self._finish(req, FinishReason.STOP)
                 finished[req.req_id] = FinishReason.STOP
             elif len(req.output) >= req.max_tokens:

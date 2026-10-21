@@ -22,6 +22,12 @@ cmake.build-type = "Release"
 wheel.packages = ["prefixserve"]
 build-dir = "build/{wheel_tag}"
 
+[tool.mypy]
+# No stubs / py.typed for these.
+[[tool.mypy.overrides]]
+module = ["transformers.*", "flashinfer.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # A scheduler bug that loops forever should fail fast, not hang CI.

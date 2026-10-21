@@ -1,9 +1,10 @@
-"""OpenAI-style HTTP server: POST /v1/chat/completions, with SSE streaming.
+"""OpenAI-style HTTP server: /v1/completions and /v1/chat/completions, with SSE streaming.
 
 Shape:
 
-    HTTP handlers  --submit/abort-->  EngineLoop (one asyncio task)  -->  Scheduler + MockEngine
-          ^                                   |
+    HTTP handlers  --submit/abort-->  EngineLoop (one asyncio task)  -->  Scheduler
+          ^                                   |                              |
+          |                                   +--> engine.step() in ONE worker thread (GPU)
           +------ per-request bounded queue <-+
 
 Rules that keep one bad client from hurting everyone:
@@ -22,7 +23,8 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -31,22 +33,24 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from prefixserve.engine import Engine
 from prefixserve.mock_engine import MockEngine
 from prefixserve.scheduler import AddResult, FinishReason, Scheduler, StepResult
-from prefixserve.tokenizer import EOS_ID, ChatMessage, StreamDecoder, apply_chat_template
+from prefixserve.tokenizer import ByteTokenizer, ChatMessage, TextTokenizer
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class ServerConfig:
-    num_blocks: int = 4096  # 4096 x 16 = 65k tokens of KV
+    num_blocks: int = 4096  # 4096 x 16 = 65k tokens of KV. Ignored if the engine owns a pool.
     max_waiting: int = 256
     # 512: same simulated throughput as 2048, ~2.7x lower p99 time between
     # tokens (bench/sim.py budget sweep). Bigger = decodes wait behind longer prefills.
     max_prefill_tokens: int = 512
     max_decode_seqs: int = 64
     chunk_size: int = 512
+    enable_prefix_cache: bool = True
     stream_queue_size: int = 256  # tokens a client may fall behind before it's cut off
     request_timeout_s: float = 300.0
     drain_timeout_s: float = 30.0
@@ -104,19 +108,28 @@ class LoopMetrics:
     slow_client_aborts: int = 0
     disconnect_aborts: int = 0
     last_step_ms: float = 0.0
+    # Where each step's time goes. scheduler_s / (scheduler_s + engine_s) is
+    # the scheduler overhead number the README quotes.
+    schedule_s: float = 0.0
+    engine_s: float = 0.0
+    commit_s: float = 0.0
 
 
 class EngineLoop:
     """Owns the scheduler and engine. Runs schedule -> engine -> commit forever."""
 
-    def __init__(self, config: ServerConfig, engine: MockEngine) -> None:
+    def __init__(self, config: ServerConfig, engine: Engine) -> None:
         self.config = config
         self.engine = engine
+        # A real engine sized its KV pool from GPU memory. The scheduler must
+        # hand out exactly those block ids, never more.
+        num_blocks = engine.num_blocks if engine.num_blocks is not None else config.num_blocks
         self.scheduler = Scheduler(
-            config.num_blocks,
+            num_blocks,
             max_waiting=config.max_waiting,
             chunk_size=config.chunk_size,
-            eos_token_id=EOS_ID,
+            stop_token_ids=engine.stop_token_ids,
+            enable_prefix_cache=config.enable_prefix_cache,
         )
         self.metrics = LoopMetrics()
         self.draining = False
@@ -124,6 +137,15 @@ class EngineLoop:
         self._handles: dict[str, RequestHandle] = {}
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        # One thread, on purpose. The engine's pinned input buffer and the
+        # CUDA stream are not safe to use from two threads, and steps must
+        # run in order anyway: step N+1 reads KV that step N wrote.
+        #
+        # Why a thread at all: engine.step() blocks until the GPU is done
+        # (the .tolist() sync). Called on the event loop, it would freeze
+        # every HTTP handler for the whole step: no new requests, no tokens
+        # streamed, no disconnects noticed.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefixserve-engine")
 
     # -- lifecycle
 
@@ -151,18 +173,24 @@ class EngineLoop:
                 pass
             except Exception:  # already logged in _run
                 pass
+        # A step may still be running in the worker. Wait for it off the loop,
+        # so the GPU isn't torn down under a running kernel.
+        await asyncio.to_thread(self._executor.shutdown, wait=True)
 
     # -- called by HTTP handlers (same thread, so no locks needed)
 
-    def submit(self, prompt: list[int], max_tokens: int) -> RequestHandle:
+    def submit(self, prompt: list[int], max_tokens: int, *, ignore_eos: bool = False) -> RequestHandle:
         if not self.healthy:
             raise AdmissionError(503, "engine is not running")
         if self.draining:
             raise AdmissionError(503, "server is shutting down")
-        rid = f"chatcmpl-{uuid.uuid4().hex}"
+        limit_len = self.engine.max_seq_len
+        if limit_len is not None and len(prompt) + max_tokens > limit_len:
+            raise AdmissionError(400, f"prompt + max_tokens is over the {limit_len}-token limit")
+        rid = f"cmpl-{uuid.uuid4().hex}"
         limit = self.config.stream_queue_size
         handle = RequestHandle(rid, len(prompt), asyncio.Queue(maxsize=limit + 1), limit)
-        result = self.scheduler.add_request(rid, prompt, max_tokens)
+        result = self.scheduler.add_request(rid, prompt, max_tokens, ignore_eos=ignore_eos)
         if result is not AddResult.ACCEPTED:
             status, msg = _ADMISSION_ERRORS[result]
             raise AdmissionError(status, msg)
@@ -180,6 +208,8 @@ class EngineLoop:
 
     async def _run(self) -> None:
         cfg = self.config
+        loop = asyncio.get_running_loop()
+        m = self.metrics
         try:
             while True:
                 if not self.scheduler.has_work():
@@ -188,7 +218,7 @@ class EngineLoop:
                     await self._wake.wait()
                     continue
 
-                started = time.perf_counter()
+                t0 = time.perf_counter()
                 batch = self.scheduler.schedule_step(cfg.max_prefill_tokens, cfg.max_decode_seqs)
                 if not batch.work:
                     # Nothing could run (e.g. every waiting request is blocked on
@@ -196,17 +226,21 @@ class EngineLoop:
                     self.scheduler.commit(batch, {})
                     await asyncio.sleep(0.001)
                     continue
-
-                # The "GPU" runs here. asyncio.sleep doesn't block the event
-                # loop, so HTTP handlers keep accepting and streaming meanwhile.
-                # With a real model this would be an await on the GPU stream or
-                # a worker process, never a blocking call on this thread.
-                await asyncio.sleep(self.engine.step_seconds(batch))
-                result = self.scheduler.commit(batch, self.engine.sample(batch))
+                t1 = time.perf_counter()
+                # HTTP handlers keep running while the worker thread waits on
+                # the GPU. Aborts that arrive now are deferred to commit(), so
+                # the worker never reads a block table that's being freed.
+                sampled = await loop.run_in_executor(self._executor, self.engine.step, batch)
+                t2 = time.perf_counter()
+                result = self.scheduler.commit(batch, sampled)
                 self._deliver(result)
+                t3 = time.perf_counter()
 
-                self.metrics.steps += 1
-                self.metrics.last_step_ms = (time.perf_counter() - started) * 1e3
+                m.steps += 1
+                m.schedule_s += t1 - t0
+                m.engine_s += t2 - t1
+                m.commit_s += t3 - t2
+                m.last_step_ms = (t3 - t0) * 1e3
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -223,6 +257,10 @@ class EngineLoop:
             handle = self._handles.get(rid)
             if handle is None:
                 continue  # aborted while the batch ran
+            # The stop token itself isn't output. OpenAI doesn't return it
+            # and doesn't count it in completion_tokens.
+            if result.finished.get(rid) is FinishReason.STOP:
+                continue
             if handle.queue.qsize() >= handle.token_limit:
                 # Client isn't reading. Cut it off instead of buffering
                 # forever (memory) or waiting on it (stalls everyone).
@@ -230,8 +268,7 @@ class EngineLoop:
                 self._close(rid, DoneEvent("error", "client too slow, stream cut off"))
                 self.scheduler.free_request(rid)
                 continue
-            if token != EOS_ID:
-                self.metrics.generated_tokens += 1
+            self.metrics.generated_tokens += 1
             handle.queue.put_nowait(TokenEvent(token))
 
         for rid, reason in result.finished.items():
@@ -250,12 +287,17 @@ class EngineLoop:
         st = self.scheduler.stats()
         m = self.metrics
         uptime = time.monotonic() - m.started_at
+        busy = m.schedule_s + m.engine_s + m.commit_s
         return {
             "healthy": self.healthy,
             "draining": self.draining,
             "uptime_s": round(uptime, 3),
             "steps": m.steps,
             "last_step_ms": round(m.last_step_ms, 3),
+            "schedule_ms_total": round(m.schedule_s * 1e3, 3),
+            "engine_ms_total": round(m.engine_s * 1e3, 3),
+            "commit_ms_total": round(m.commit_s * 1e3, 3),
+            "scheduler_overhead": round((m.schedule_s + m.commit_s) / busy, 5) if busy > 0 else 0.0,
             "generated_tokens": m.generated_tokens,
             "generated_tokens_per_s": round(m.generated_tokens / uptime, 2) if uptime > 0 else 0.0,
             "slow_client_aborts": m.slow_client_aborts,
@@ -280,11 +322,29 @@ class Message(BaseModel):
     content: str = Field(max_length=200_000)
 
 
-class ChatRequest(BaseModel):
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
+class _GenParams(BaseModel):
     model: str | None = None
-    messages: list[Message] = Field(min_length=1, max_length=256)
-    max_tokens: int = Field(default=128, ge=1, le=8192)
+    max_tokens: int = Field(default=128, ge=1, le=32768)
     stream: bool = False
+    stream_options: StreamOptions | None = None
+    # Greedy only. None and 0 both mean greedy; anything else is refused
+    # rather than silently run greedy, so a client never gets output it
+    # didn't ask for.
+    temperature: float | None = Field(default=None, ge=0)
+    ignore_eos: bool = False
+
+
+class ChatRequest(_GenParams):
+    messages: list[Message] = Field(min_length=1, max_length=256)
+
+
+class CompletionRequest(_GenParams):
+    # Benchmark clients send a string. Token ids are accepted too (OpenAI allows it).
+    prompt: str | list[int] = Field(min_length=1)
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -297,9 +357,45 @@ def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
 
-def create_app(config: ServerConfig | None = None, engine: MockEngine | None = None) -> FastAPI:
+def _usage(handle: RequestHandle, completion_tokens: int) -> dict[str, int]:
+    return {
+        "prompt_tokens": handle.prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": handle.prompt_tokens + completion_tokens,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _Shape:
+    """The two OpenAI response shapes. Everything else is shared."""
+
+    chunk_object: str
+    full_object: str
+    delta: Callable[[str], dict[str, Any]]  # text -> choice fields for a stream chunk
+    full: Callable[[str], dict[str, Any]]  # text -> choice fields for a full response
+    first: dict[str, Any] | None  # chat sends {"role": "assistant"} first
+
+
+_CHAT = _Shape(
+    "chat.completion.chunk", "chat.completion",
+    delta=lambda t: {"delta": {"content": t} if t else {}},
+    full=lambda t: {"message": {"role": "assistant", "content": t}},
+    first={"delta": {"role": "assistant"}},
+)
+_TEXT = _Shape(
+    "text_completion", "text_completion",
+    delta=lambda t: {"text": t, "logprobs": None},
+    full=lambda t: {"text": t, "logprobs": None},
+    first=None,
+)
+
+
+def create_app(
+    config: ServerConfig | None = None, engine: Engine | None = None, tokenizer: TextTokenizer | None = None
+) -> FastAPI:
     cfg = config or ServerConfig()
-    eng = engine or MockEngine()
+    eng: Engine = engine or MockEngine()
+    tok: TextTokenizer = tokenizer or ByteTokenizer()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -327,60 +423,88 @@ def create_app(config: ServerConfig | None = None, engine: MockEngine | None = N
     async def metrics(request: Request) -> JSONResponse:
         return JSONResponse(get_loop(request).snapshot())
 
-    @app.post("/v1/chat/completions", response_model=None)
-    async def chat_completions(body: ChatRequest, request: Request) -> Response:
+    async def generate(body: _GenParams, prompt: list[int], shape: _Shape, request: Request) -> Response:
+        if body.temperature:
+            return _error(400, "only greedy decoding (temperature 0) is supported")
         loop = get_loop(request)
-        messages: list[ChatMessage] = [{"role": m.role, "content": m.content} for m in body.messages]
-        prompt = apply_chat_template(messages)
         try:
-            handle = loop.submit(prompt, body.max_tokens)
+            handle = loop.submit(prompt, body.max_tokens, ignore_eos=body.ignore_eos)
         except AdmissionError as e:
             return _error(e.status, e.message)
-
         model = body.model or cfg.model_name
         if body.stream:
+            include_usage = body.stream_options is not None and body.stream_options.include_usage
             return StreamingResponse(
-                _stream(loop, handle, model, cfg.request_timeout_s),
+                _stream(loop, handle, tok, shape, model, cfg.request_timeout_s, include_usage),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
-        return await _complete(loop, handle, model, cfg.request_timeout_s, request)
+        return await _complete(loop, handle, tok, shape, model, cfg.request_timeout_s, request)
+
+    @app.post("/v1/chat/completions", response_model=None)
+    async def chat_completions(body: ChatRequest, request: Request) -> Response:
+        messages: list[ChatMessage] = [{"role": m.role, "content": m.content} for m in body.messages]
+        return await generate(body, tok.encode_chat(messages), _CHAT, request)
+
+    @app.post("/v1/completions", response_model=None)
+    async def completions(body: CompletionRequest, request: Request) -> Response:
+        prompt = tok.encode_prompt(body.prompt) if isinstance(body.prompt, str) else body.prompt
+        return await generate(body, prompt, _TEXT, request)
 
     return app
 
 
-async def _stream(loop: EngineLoop, handle: RequestHandle, model: str, timeout_s: float) -> AsyncIterator[str]:
+async def _stream(
+    loop: EngineLoop,
+    handle: RequestHandle,
+    tok: TextTokenizer,
+    shape: _Shape,
+    model: str,
+    timeout_s: float,
+    include_usage: bool,
+) -> AsyncIterator[str]:
     created = int(time.time())
 
-    def chunk(delta: dict[str, str], finish: str | None = None) -> str:
+    def chunk(choice: dict[str, Any], finish: str | None = None) -> str:
         return _sse({
             "id": handle.req_id,
-            "object": "chat.completion.chunk",
+            "object": shape.chunk_object,
             "created": created,
             "model": model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            "choices": [{"index": 0, **choice, "finish_reason": finish}],
         })
 
     done = False
+    completion_tokens = 0
     try:
         async with asyncio.timeout(timeout_s):
-            yield chunk({"role": "assistant"})
-            decoder = StreamDecoder()
+            if shape.first is not None:
+                yield chunk(shape.first)
+            decoder = tok.stream_decoder()
             while True:
                 event = await handle.queue.get()
                 if isinstance(event, TokenEvent):
+                    completion_tokens += 1
+                    # Only send when there's text. Benchmark clients time
+                    # inter-token latency per non-empty chunk, same as for
+                    # vLLM/SGLang, which also hold back partial characters.
                     text = decoder.push(event.token)
                     if text:
-                        yield chunk({"content": text})
+                        yield chunk(shape.delta(text))
                     continue
                 done = True
                 tail = decoder.flush()
                 if tail:
-                    yield chunk({"content": tail})
+                    yield chunk(shape.delta(tail))
                 if event.reason == "error":
                     yield _sse({"error": {"message": event.message, "type": "server_error"}})
                 else:
-                    yield chunk({}, finish=event.reason)
+                    yield chunk(shape.delta(""), finish=event.reason)
+                    if include_usage:
+                        yield _sse({
+                            "id": handle.req_id, "object": shape.chunk_object, "created": created,
+                            "model": model, "choices": [], "usage": _usage(handle, completion_tokens),
+                        })
                 yield "data: [DONE]\n\n"
                 return
     except TimeoutError:
@@ -394,7 +518,13 @@ async def _stream(loop: EngineLoop, handle: RequestHandle, model: str, timeout_s
 
 
 async def _complete(
-    loop: EngineLoop, handle: RequestHandle, model: str, timeout_s: float, request: Request
+    loop: EngineLoop,
+    handle: RequestHandle,
+    tok: TextTokenizer,
+    shape: _Shape,
+    model: str,
+    timeout_s: float,
+    request: Request,
 ) -> Response:
     tokens: list[int] = []
     done = False
@@ -410,29 +540,18 @@ async def _complete(
                         return Response(status_code=499)
                     continue
                 if isinstance(event, TokenEvent):
-                    if event.token != EOS_ID:
-                        tokens.append(event.token)
+                    tokens.append(event.token)
                     continue
                 done = True
                 if event.reason == "error":
                     return _error(503, event.message)
-                decoder = StreamDecoder()
-                text = "".join(decoder.push(t) for t in tokens) + decoder.flush()
                 return JSONResponse({
                     "id": handle.req_id,
-                    "object": "chat.completion",
+                    "object": shape.full_object,
                     "created": int(time.time()),
                     "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": event.reason,
-                    }],
-                    "usage": {
-                        "prompt_tokens": handle.prompt_tokens,
-                        "completion_tokens": len(tokens),
-                        "total_tokens": handle.prompt_tokens + len(tokens),
-                    },
+                    "choices": [{"index": 0, **shape.full(tok.decode(tokens)), "finish_reason": event.reason}],
+                    "usage": _usage(handle, len(tokens)),
                 })
     except TimeoutError:
         return _error(504, "request timed out")
@@ -445,24 +564,58 @@ def main() -> None:
     import uvicorn
 
     d = ServerConfig()  # read defaults from an instance: with slots=True the class attrs are descriptors
-    p = argparse.ArgumentParser(description="PrefixServe mock LLM server")
+    p = argparse.ArgumentParser(description="PrefixServe LLM server")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--num-blocks", type=int, default=d.num_blocks)
+    p.add_argument("--model", default=None, help="HF Llama folder. Omit to run the mock engine.")
+    p.add_argument("--served-model-name", default=None)
+    p.add_argument("--attention", choices=["flashinfer", "torch"], default="flashinfer")
+    p.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
+    p.add_argument("--max-seq-len", type=int, default=8192)
+    p.add_argument("--num-blocks", type=int, default=None,
+                   help="KV blocks. Default: mock 4096, real model sized from free GPU memory.")
     p.add_argument("--max-waiting", type=int, default=d.max_waiting)
-    p.add_argument("--max-decode-seqs", type=int, default=d.max_decode_seqs)
-    p.add_argument("--max-prefill-tokens", type=int, default=d.max_prefill_tokens)
-    p.add_argument("--eos-prob", type=float, default=0.0, help="chance each token is EOS")
+    p.add_argument("--max-running-requests", type=int, default=d.max_decode_seqs)
+    p.add_argument("--chunked-prefill-size", type=int, default=d.max_prefill_tokens)
+    p.add_argument("--disable-prefix-cache", action="store_true")
+    p.add_argument("--eos-prob", type=float, default=0.0, help="mock only: chance each token is EOS")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     cfg = ServerConfig(
-        num_blocks=args.num_blocks,
+        num_blocks=args.num_blocks or d.num_blocks,
         max_waiting=args.max_waiting,
-        max_decode_seqs=args.max_decode_seqs,
-        max_prefill_tokens=args.max_prefill_tokens,
+        max_decode_seqs=args.max_running_requests,
+        max_prefill_tokens=args.chunked_prefill_size,
+        chunk_size=args.chunked_prefill_size,
+        enable_prefix_cache=not args.disable_prefix_cache,
+        model_name=args.served_model_name or args.model or d.model_name,
     )
-    uvicorn.run(create_app(cfg, MockEngine(eos_prob=args.eos_prob)), host=args.host, port=args.port)
+    engine: Engine
+    tokenizer: TextTokenizer
+    if args.model is None:
+        engine, tokenizer = MockEngine(eos_prob=args.eos_prob), ByteTokenizer()
+    else:
+        # Heavy imports only when serving a real model, so the mock server
+        # and its tests don't need torch.
+        from pathlib import Path
+
+        import torch
+
+        from prefixserve.hf_tokenizer import HFTokenizer
+        from prefixserve.llama_engine import EngineConfig, LlamaEngine
+
+        engine = LlamaEngine(EngineConfig(
+            model_path=Path(args.model),
+            dtype=getattr(torch, args.dtype),
+            attention=args.attention,
+            max_num_seqs=cfg.max_decode_seqs,
+            max_prefill_tokens=cfg.max_prefill_tokens,
+            max_seq_len=args.max_seq_len,
+            num_blocks=args.num_blocks,
+        ))
+        tokenizer = HFTokenizer(args.model)
+    uvicorn.run(create_app(cfg, engine, tokenizer), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

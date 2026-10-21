@@ -217,7 +217,7 @@ def test_prompt_is_copied() -> None:
 
 
 def test_finish_on_length_and_eos_keeps_prefix_cached() -> None:
-    s = Scheduler(32, eos_token_id=4242)
+    s = Scheduler(32, stop_token_ids={4242})
     s.add_request("len", toks(40), max_tokens=3)
     _, result = step(s)
     assert result.finished == {}

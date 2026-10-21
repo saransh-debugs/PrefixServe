@@ -223,3 +223,77 @@ async def test_engine_crash_fails_requests_and_health() -> None:
         assert "engine failure" in r.json()["error"]["message"]
         assert (await client.get("/health")).status_code == 503
         assert (await client.post("/v1/chat/completions", json=body())).status_code == 503
+
+
+# ---- /v1/completions (what benchmark clients hit)
+
+
+def cbody(prompt: str | list[int] = "hello", **kw: Any) -> dict[str, Any]:
+    return {"prompt": prompt, "max_tokens": 16, **kw}
+
+
+async def test_completions_non_streaming() -> None:
+    async with serve(ServerConfig(), MockEngine(FAST)) as (client, _):
+        r = await client.post("/v1/completions", json=cbody(max_tokens=30, temperature=0))
+        assert r.status_code == 200
+        data = r.json()
+        assert data["object"] == "text_completion"
+        choice = data["choices"][0]
+        assert choice["finish_reason"] == "length" and len(choice["text"]) == 30
+        assert data["usage"] == {"prompt_tokens": 6, "completion_tokens": 30, "total_tokens": 36}  # BOS + 5 bytes
+
+
+async def test_completions_streaming_openai_format() -> None:
+    req = cbody(max_tokens=20, stream=True, stream_options={"include_usage": True})
+    async with serve(ServerConfig(), MockEngine(FAST)) as (client, app):
+        async with client.stream("POST", "/v1/completions", json=req) as r:
+            assert r.headers["content-type"].startswith("text/event-stream")
+            events = await read_sse(r)
+        assert events[-1] == "[DONE]"
+        usage_chunk, final = events[-2], events[-3]
+        assert usage_chunk["choices"] == [] and usage_chunk["usage"]["completion_tokens"] == 20
+        assert final["choices"][0]["finish_reason"] == "length" and final["choices"][0]["text"] == ""
+        deltas = events[:-3]
+        assert all(e["object"] == "text_completion" and e["choices"][0]["finish_reason"] is None for e in deltas)
+        assert len("".join(e["choices"][0]["text"] for e in deltas)) == 20
+        assert_no_leak(app, await wait_until_idle(client))
+
+
+async def test_ignore_eos_runs_to_max_tokens() -> None:
+    """Benchmarks need exact output lengths. Every token is EOS here."""
+    async with serve(ServerConfig(), MockEngine(FAST, eos_prob=1.0)) as (client, _):
+        stopped = (await client.post("/v1/completions", json=cbody(max_tokens=10))).json()
+        assert stopped["choices"][0]["finish_reason"] == "stop"
+        assert stopped["usage"]["completion_tokens"] == 0
+        full = (await client.post("/v1/completions", json=cbody(max_tokens=10, ignore_eos=True))).json()
+        assert full["choices"][0]["finish_reason"] == "length"
+        assert full["usage"]["completion_tokens"] == 10
+
+
+async def test_completions_rejects_what_it_cant_do() -> None:
+    async with serve(ServerConfig(), MockEngine(FAST)) as (client, _):
+        r = await client.post("/v1/completions", json=cbody(temperature=0.7))
+        assert r.status_code == 400 and "greedy" in r.json()["error"]["message"]
+        assert (await client.post("/v1/completions", json=cbody(prompt=""))).status_code == 422
+        r = await client.post("/v1/completions", json=cbody(prompt=[1, 50, 60, 70]))
+        assert r.status_code == 200 and r.json()["usage"]["prompt_tokens"] == 4
+
+
+class ShortEngine(MockEngine):
+    max_seq_len = 32
+
+
+async def test_max_seq_len_enforced_at_admission() -> None:
+    """Past max_seq_len the engine has no RoPE rows. Refuse up front, not mid-generation."""
+    async with serve(ServerConfig(), ShortEngine(FAST)) as (client, _):
+        r = await client.post("/v1/completions", json=cbody(prompt="x" * 20, max_tokens=20))
+        assert r.status_code == 400 and "32-token limit" in r.json()["error"]["message"]
+        assert (await client.post("/v1/completions", json=cbody(prompt="x" * 20, max_tokens=10))).status_code == 200
+
+
+async def test_metrics_split_step_time() -> None:
+    async with serve(ServerConfig(), MockEngine(SLOW)) as (client, _):
+        await client.post("/v1/completions", json=cbody(max_tokens=5))
+        m = (await client.get("/metrics")).json()
+        assert m["engine_ms_total"] > m["schedule_ms_total"] + m["commit_ms_total"]
+        assert 0 < m["scheduler_overhead"] < 0.5

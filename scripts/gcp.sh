@@ -2,6 +2,7 @@
 # Dev / bench VM on GCP. Run from the repo root.
 #
 #   scripts/gcp.sh create      # L4 spot VM (default) or GPU=a100 for the A100
+#                              # SNAPSHOT=name ZONE=z to restore a saved disk in another zone
 #   scripts/gcp.sh sync        # copy the working tree up (no venvs, no build dirs)
 #   scripts/gcp.sh run 'cmd'   # run a command in ~/PrefixServe on the VM
 #   scripts/gcp.sh ssh | stop | start | delete | status
@@ -12,11 +13,11 @@
 set -euo pipefail
 
 PROJECT="${PROJECT:-govrag-portfolio-fe8b}"
-ZONE="${ZONE:-us-central1-b}"  # a had no spot L4 capacity on 2026-10-21
+ZONE="${ZONE:-us-central1-a}"  # spot L4 stock moves between zones; see SNAPSHOT below
 GPU="${GPU:-l4}"
 case "$GPU" in
   # g2 / a2 machine types come with their GPU attached; no --accelerator flag.
-  l4)   NAME="${NAME:-prefixserve-l4}";   MACHINE="g2-standard-8"; PROV="SPOT" ;;
+  l4)   NAME="${NAME:-prefixserve-l4b}";   MACHINE="g2-standard-8"; PROV="SPOT" ;;
   a100) NAME="${NAME:-prefixserve-a100}"; MACHINE="a2-highgpu-1g"; PROV="STANDARD" ;;
   *) echo "GPU must be l4 or a100" >&2; exit 2 ;;
 esac
@@ -47,13 +48,20 @@ case "$cmd" in
   create)
     startup=$(mktemp); trap 'rm -f "$startup"' EXIT
     printf '%s\n' "$IDLE_SCRIPT" > "$startup"
+    # SNAPSHOT=name: boot from a snapshot of an earlier VM (keeps the venv
+    # and downloaded models). Snapshots are global, so this is also how the
+    # VM moves to another zone when one runs out of spot GPUs.
+    if [ -n "${SNAPSHOT:-}" ]; then
+      disk_src=(--source-snapshot="$SNAPSHOT")
+    else
+      disk_src=(--image-family=common-cu129-ubuntu-2204-nvidia-580 --image-project=deeplearning-platform-release)
+    fi
     extra=()
     [ "$PROV" = "SPOT" ] && extra+=(--provisioning-model=SPOT --instance-termination-action=STOP)
     gcloud compute instances create "$NAME" "${G[@]}" \
       --machine-type="$MACHINE" \
       --maintenance-policy=TERMINATE \
-      --image-family=common-cu129-ubuntu-2204-nvidia-580 \
-      --image-project=deeplearning-platform-release \
+      "${disk_src[@]}" \
       --boot-disk-size=200GB --boot-disk-type=pd-balanced \
       --metadata=install-nvidia-driver=True \
       --metadata-from-file=startup-script="$startup" \

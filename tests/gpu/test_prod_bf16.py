@@ -1,14 +1,20 @@
 """Production tier: real Llama in bf16 through FlashInfer vs HF LlamaForCausalLM.
 
-Exact token match over long generations isn't a fair bar in bf16: a
-different batch mix changes the reduction order, and greedy outputs can
-split after a few dozen tokens with both sides "correct". So:
+"First N tokens match exactly" is not a fair bar in bf16. Logits here are
+~20-30, where bf16 can only step by 0.125. When HF's top two choices are
+1-3 of those steps apart, either kernel can pick either one. Measured on
+8B: free-run splits at token 9 (top-2 gap 0.375) and 27 (gap 0.125), with
+100% teacher-forced agreement everywhere else. So:
 
-1. Free-running greedy: the first 16 tokens must match HF exactly.
-2. Teacher-forced: feed both models HF's 256 generated tokens. At every
-   step our argmax must agree with HF's > 99% of the time, and our logits
-   must stay close (cosine similarity). A real bug (wrong block, wrong
-   position) drops agreement to near 0, not to 98%.
+1. Free-running greedy: we may split from HF only at a near-tie
+   (HF top-1 minus top-2 < NEAR_TIE). Never on a clear decision.
+2. Teacher-forced: feed both models HF's tokens. Our argmax must agree
+   with HF's >= 99% of the time and logits must stay close (cosine).
+   A real bug (wrong block, wrong position) drops agreement to near 0.
+
+Both are scored only up to where HF's answer ends (its first stop token).
+HF is forced to generate past that (min_new_tokens), into filler text where
+the logits are nearly flat and tiny differences look huge (cosine 0.85).
 
 All prompts run at once, so batching, prefix sharing and chunked prefill
 are on the path, not just single-request decode.
@@ -35,12 +41,13 @@ if not MODEL or not torch.cuda.is_available():
 pytest.importorskip("flashinfer")
 
 from prefixserve import Scheduler  # noqa: E402
+from prefixserve.hf_tokenizer import HFTokenizer  # noqa: E402
 from prefixserve.llama_engine import EngineConfig, LlamaEngine  # noqa: E402
 
 GEN = 256
-EXACT_PREFIX = 16
 MIN_TOP1_AGREEMENT = 0.99
 MIN_COSINE = 0.99
+NEAR_TIE = 0.5  # logits; ~2-4 bf16 steps at this magnitude
 
 SYSTEM = (
     "You are the support assistant for Blue Horizon Travel. You help with bookings, "
@@ -55,24 +62,34 @@ QUESTIONS = [
 ]
 
 
-def prompts(tok: Any) -> list[list[int]]:
-    return [
-        tok.apply_chat_template(
-            [{"role": "system", "content": SYSTEM}, {"role": "user", "content": q}],
-            add_generation_prompt=True, tokenize=True,
-        )
-        for q in QUESTIONS
-    ]
+def prompts() -> list[list[int]]:
+    # Through our tokenizer, same as the server. (Raw apply_chat_template
+    # returns a list in transformers 4 and a BatchEncoding in 5.)
+    tok = HFTokenizer(MODEL or "")
+    return [tok.encode_chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": q}]) for q in QUESTIONS]
+
+
+def answer_len(want_logits: Any, stops: frozenset[int]) -> int:
+    """Steps until HF's own argmax is a stop token: where its answer ends."""
+    hits = [j for j, t in enumerate(want_logits.argmax(-1).tolist()) if t in stops]
+    return hits[0] if hits else want_logits.shape[0]
+
+
+@pytest.fixture(scope="module")
+def stops() -> frozenset[int]:
+    from prefixserve.model.config import LlamaConfig
+
+    return LlamaConfig.from_dir(MODEL or "").stop_token_ids
 
 
 @pytest.fixture(scope="module")
 def reference() -> list[tuple[list[int], list[int], Any]]:
     """Per prompt: (prompt ids, HF greedy tokens, HF teacher-forced logits [GEN, vocab])."""
     tok = transformers.AutoTokenizer.from_pretrained(MODEL)
-    hf = transformers.LlamaForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda().eval()
+    hf = transformers.LlamaForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16).cuda().eval()
     out = []
     with torch.inference_mode():
-        for p in prompts(tok):
+        for p in prompts():
             ids = torch.tensor([p], device="cuda")
             gen = hf.generate(ids, max_new_tokens=GEN, min_new_tokens=GEN, do_sample=False, pad_token_id=tok.eos_token_id)
             toks = gen[0, len(p):].tolist()
@@ -109,23 +126,35 @@ def run_ours(reference: list[tuple[list[int], list[int], Any]], forced: bool) ->
     return ours, logits
 
 
-def test_first_tokens_exact(reference: list[tuple[list[int], list[int], Any]]) -> None:
+def test_free_run_splits_only_at_near_ties(reference: list[tuple[list[int], list[int], Any]], stops: frozenset[int]) -> None:
     ours, _ = run_ours(reference, forced=False)
-    for i, (_, want, _) in enumerate(reference):
-        assert ours[f"R{i}"][:EXACT_PREFIX] == want[:EXACT_PREFIX], f"R{i}: first {EXACT_PREFIX} tokens differ"
+    for i, (_, want, want_logits) in enumerate(reference):
+        n = answer_len(want_logits, stops)
+        got = ours[f"R{i}"]
+        split = next((j for j in range(n) if got[j] != want[j]), None)
+        if split is None:
+            print(f"R{i}: identical for all {n} answer tokens")
+            continue
+        top2 = want_logits[split].topk(2).values
+        gap = float(top2[0] - top2[1])
+        print(f"R{i}: split at token {split}/{n}, HF top-2 gap {gap:.3f}")
+        assert gap < NEAR_TIE, f"R{i}: split at token {split} where HF was sure (gap {gap:.2f}): a bug, not rounding"
 
 
-def test_teacher_forced_agreement(reference: list[tuple[list[int], list[int], Any]]) -> None:
-    ours, logits = run_ours(reference, forced=True)
+def test_teacher_forced_agreement(reference: list[tuple[list[int], list[int], Any]], stops: frozenset[int]) -> None:
+    _, logits = run_ours(reference, forced=True)
     agree = total = 0
     worst_cos = 1.0
     for i, (_, _, want_logits) in enumerate(reference):
         got = torch.stack(logits[f"R{i}"])
         assert got.shape == want_logits.shape
-        agree += int((got.argmax(-1) == want_logits.argmax(-1)).sum())
-        total += got.shape[0]
-        worst_cos = min(worst_cos, float(torch.nn.functional.cosine_similarity(got, want_logits, dim=-1).min()))
+        n = answer_len(want_logits, stops)
+        got, want = got[:n], want_logits[:n]
+        agree += int((got.argmax(-1) == want.argmax(-1)).sum())
+        total += n
+        worst_cos = min(worst_cos, float(torch.nn.functional.cosine_similarity(got, want, dim=-1).min()))
     rate = agree / total
-    print(f"top-1 agreement {rate:.4f} over {total} steps, worst cosine {worst_cos:.5f}")
+    print(f"top-1 agreement {rate:.4f} over {total} answer steps, worst cosine {worst_cos:.5f}")
+    assert total >= 200, "answers too short to mean anything"
     assert rate >= MIN_TOP1_AGREEMENT
     assert worst_cos >= MIN_COSINE
